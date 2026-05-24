@@ -13,6 +13,8 @@
 %      Se la policy richiede più di 3 osservazioni, vengono aggiunti zeri.
 %   6. Se una qualunque simulazione fallisce, il programma si ferma subito.
 %      Viene salvato un CSV parziale e poi l'errore viene rilanciato.
+%   7. Il k_L scelto dalla Policy viene salvato tramite un To Workspace
+%      automatico collegato all'uscita del blocco Policy.
 % =========================================================
 
 clc;
@@ -26,6 +28,7 @@ MODEL_OBSERVATION_DIM = 3;
 
 RESULTS_DIR = "test_results";
 POLICY_DATA_FILE = "blockAgentData.mat";
+ACTION_TO_WORKSPACE_VAR = "k_L_policy";
 
 mdl = "SAC_simulink";
 policyBlock = mdl + "/Policy";
@@ -43,6 +46,7 @@ partialCsvFile = fullfile(RESULTS_DIR,"PARTIAL_all_agents_random_training_domain
 finalCsvFile   = fullfile(RESULTS_DIR,"all_agents_random_training_domain_results_" + timestamp + ".csv");
 summaryCsvFile = fullfile(RESULTS_DIR,"all_agents_random_training_domain_summary_" + timestamp + ".csv");
 matFile        = fullfile(RESULTS_DIR,"all_agents_random_training_domain_results_" + timestamp + ".mat");
+fatalReportFile = fullfile(RESULTS_DIR,"FATAL_batch_report_" + timestamp + ".txt");
 
 %% SETUP MODEL
 setupBaseWorkspace(Tf,Ts);
@@ -53,11 +57,12 @@ end
 
 prepare_sac_simulink_batch_model(mdl);
 policyBlock = findPolicyBlock(mdl, policyBlock);
-tryEnablePolicyActionLogging(policyBlock);
+ensurePolicyActionToWorkspace(mdl, policyBlock, ACTION_TO_WORKSPACE_VAR);
 
 fprintf("Modello usato: %s\n", mdl);
 fprintf("Policy block usato: %s\n", policyBlock);
 fprintf("Policy MAT file fisso: %s\n", POLICY_DATA_FILE);
+fprintf("Variabile To Workspace per k_L: %s\n", ACTION_TO_WORKSPACE_VAR);
 
 %% FIND AGENTS
 agentFiles = findAllAgentFilesRecursive(pwd, RESULTS_DIR);
@@ -115,17 +120,18 @@ try
 
         regenerateFixedPolicyDataFile(agent,POLICY_DATA_FILE,mdl);
         prepare_sac_simulink_batch_model(mdl);
+        ensurePolicyActionToWorkspace(mdl, policyBlock, ACTION_TO_WORKSPACE_VAR);
 
         for iTest = 1:N_TESTS
             fprintf("  Test %3d/%3d... ",iTest,N_TESTS);
 
-            clearLoggedWorkspaceVariables();
+            clearLoggedWorkspaceVariables(ACTION_TO_WORKSPACE_VAR);
             assignInitialCondition(IC(iTest),target);
 
             simOut = sim(mdl,"StopTime",num2str(Tf),"ReturnWorkspaceOutputs","on");
 
             [finalPos,sourceName] = extractFinalPosition(simOut);
-            kL = extractActionValue(simOut);
+            kL = extractActionValue(simOut,ACTION_TO_WORKSPACE_VAR);
             errXY = norm(finalPos(1:2)-target(1:2));
             err3D = norm(finalPos-target);
             errPercent = 100*errXY/max(IC(iTest).r0,eps);
@@ -172,6 +178,8 @@ try
 catch ME
     fprintf("\n[ERRORE FATALE] Batch interrotto alla prima simulazione fallita.\n");
     fprintf("Messaggio: %s\n",ME.message);
+    writeFatalReport(ME,fatalReportFile);
+    fprintf("Report errore salvato in: %s\n",fatalReportFile);
     if ~isempty(rows)
         writePartialResults(rows,partialCsvFile);
         fprintf("Risultati parziali salvati in: %s\n",partialCsvFile);
@@ -250,18 +258,41 @@ function blockPath = findPolicyBlock(mdl,preferred)
     blockPath = char(blocks{idx});
 end
 
-function tryEnablePolicyActionLogging(policyBlock)
+function ensurePolicyActionToWorkspace(mdl,policyBlock,varName)
+    blockName = mdl + "/AUTO_policy_action_to_workspace";
+
+    ph = get_param(policyBlock,"PortHandles");
+    if isempty(ph.Outport)
+        error("Il blocco Policy non ha una porta di uscita.");
+    end
+    policyOut = ph.Outport(1);
+
+    if getSimulinkBlockHandle(blockName) <= 0
+        pos = get_param(policyOut,"Position");
+        add_block("simulink/Sinks/To Workspace",blockName, ...
+            "Position",[pos(1)+80 pos(2)-15 pos(1)+180 pos(2)+15]);
+    end
+
+    set_param(blockName,"VariableName",char(varName));
+    set_param(blockName,"SaveFormat","Array");
+    set_param(blockName,"MaxDataPoints","inf");
+    set_param(blockName,"Decimation","1");
+    set_param(blockName,"SampleTime","-1");
+
+    phSink = get_param(blockName,"PortHandles");
+    sinkLine = get_param(phSink.Inport(1),"Line");
+    if sinkLine > 0
+        try, delete_line(sinkLine); catch, end
+    end
+
     try
-        ph = get_param(policyBlock,"PortHandles");
-        ln = get_param(ph.Outport(1),"Line");
-        if ln > 0
-            try, set_param(ln,"Name","k_L"); catch, end
-            try, set_param(ln,"DataLogging","on"); catch, end
-            try, set_param(ln,"DataLoggingNameMode","Custom"); catch, end
-            try, set_param(ln,"DataLoggingName","k_L"); catch, end
-            try, set_param(bdroot(policyBlock),"SignalLogging","on"); catch, end
-            try, set_param(bdroot(policyBlock),"SignalLoggingName","logsout"); catch, end
-        end
+        add_line(mdl,policyOut,phSink.Inport(1),"autorouting","on");
+    catch
+        % If the branch already exists, leave it unchanged.
+    end
+
+    try
+        set_param(mdl,"SimulationCommand","update");
     catch
     end
 end
@@ -364,8 +395,8 @@ function assignInitialCondition(ic,target)
     assignin("base","target",target);
 end
 
-function clearLoggedWorkspaceVariables()
-    vars = ["xe","x","X","pos","position","k_L","kL","action","act","logsout"];
+function clearLoggedWorkspaceVariables(actionVarName)
+    vars = ["xe","x","X","pos","position","k_L","kL","action","act","logsout",string(actionVarName)];
     for i = 1:numel(vars)
         evalin("base",sprintf("if exist('%s','var'); clear('%s'); end",vars(i),vars(i)));
     end
@@ -425,18 +456,10 @@ function p = finalPositionFromRaw(raw)
     p = p(:);
 end
 
-function kL = extractActionValue(simOut)
+function kL = extractActionValue(simOut,actionVarName)
     kL = NaN;
-    try
-        logsout = simOut.get("logsout");
-        el = logsout.get("k_L");
-        if ~isempty(el)
-            kL = lastNumeric(el.Values);
-            return;
-        end
-    catch
-    end
-    names = ["k_L","kL","action","act"];
+    names = [string(actionVarName),"k_L_policy","k_L","kL","action","act"];
+
     for i = 1:numel(names)
         try
             kL = lastNumeric(simOut.get(char(names(i))));
@@ -444,6 +467,7 @@ function kL = extractActionValue(simOut)
         catch
         end
     end
+
     for i = 1:numel(names)
         if evalin("base",sprintf("exist('%s','var')",names(i)))
             kL = lastNumeric(evalin("base",names(i)));
@@ -506,6 +530,20 @@ end
 function writePartialResults(rows,fileName)
     if isempty(rows), return; end
     writetable(struct2table(rows),fileName);
+end
+
+function writeFatalReport(ME,fileName)
+    fid = fopen(fileName,'w');
+    if fid < 0
+        return;
+    end
+    cleanupObj = onCleanup(@() fclose(fid));
+    fprintf(fid,"Fatal batch error report\n");
+    fprintf(fid,"Generated: %s\n\n",string(datetime("now")));
+    fprintf(fid,"Identifier: %s\n",ME.identifier);
+    fprintf(fid,"Message: %s\n\n",ME.message);
+    fprintf(fid,"Extended report:\n%s\n",getReport(ME,'extended','hyperlinks','off'));
+    clear cleanupObj;
 end
 
 function summary = buildSummaryTable(T)
