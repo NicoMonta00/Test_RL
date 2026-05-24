@@ -1,7 +1,17 @@
 % =========================================================
 % test_all_agents_random_training_domain.m
-% Test all SAC agents found in the repository on 100 random
+% Test all trained SAC policies found in the repository on 100 random
 % initial conditions sampled from the same IC domain used in main_SAC.m.
+%
+% IMPORTANT FOR THIS MODEL:
+%   The Simulink model uses a Policy block, not the training RL Agent block.
+%   The Policy block always reads the fixed MAT file name:
+%
+%       blockAgentData.mat
+%
+%   Therefore this script does NOT change the Policy block file name.
+%   For each trained Agent*.mat, it regenerates/overwrites blockAgentData.mat
+%   with the policy data of the current agent, then runs the 100 simulations.
 %
 % Training IC domain replicated from localResetFcn in main_SAC.m:
 %   X0 = [-650; 0; -450] + rho*d, rho in [0,10], d random unit vector
@@ -10,8 +20,9 @@
 %   target = [0; 0; 0]
 %
 % Output expected from Simulink:
-%   The final position is read from the To Workspace variable "xe".
-%   If "xe" is not found, the script also tries common fallback names.
+%   Final position is read from the To Workspace variable "xe".
+%   The selected k_L is read from logged signal "k_L"/"action" or from
+%   workspace variables with common names if available.
 %
 % The script saves:
 %   test_results/all_agents_random_training_domain_results_*.csv
@@ -32,21 +43,21 @@ R_IC = 10;
 MAX_ANGLE_DEG = 75;
 
 RESULTS_DIR = "test_results";
+POLICY_DATA_FILE = "blockAgentData.mat";
 
 mdl = "SAC_simulink";
-agentblk = mdl + "/RL Agent";
+POLICY_BLOCK_CANDIDATES = [mdl + "/Policy", mdl + "/RL Agent"];
 
 % Simulation settings coherent with main_SAC.m.
 % The model itself now stops when landing occurs.
 Tf = 160;
 Ts = 150;
-maxsteps = 1;
 
-% Deterministic seed: all agents are tested on the same 100 ICs.
+% Deterministic seed: all policies are tested on the same 100 ICs.
 rng(1, "twister");
 
 %% ================================================================
-%% SETUP BASE WORKSPACE, MODEL AND ENVIRONMENT
+%% SETUP BASE WORKSPACE, MODEL AND POLICY BLOCK
 %% ================================================================
 setupBaseWorkspace(Tf, Ts);
 
@@ -54,18 +65,16 @@ if ~bdIsLoaded(mdl)
     open_system(mdl);
 end
 
-obsInfo = rlNumericSpec([3 1], ...
-    LowerLimit = -inf*ones(3,1), ...
-    UpperLimit =  inf*ones(3,1));
-obsInfo.Name = "observations";
+policyBlock = findPolicyBlock(mdl, POLICY_BLOCK_CANDIDATES);
+fprintf("Policy block usato: %s\n", policyBlock);
 
-actInfo = rlNumericSpec([1 1], ...
-    LowerLimit = 0.88, ...
-    UpperLimit = 1.07);
-actInfo.Name = "k_L";
+% Force the Policy block to keep using the fixed file name, if the parameter
+% is accessible in this MATLAB release. If not, the script continues because
+% the block is already configured manually from the mask.
+trySetPolicyBlockDataFile(policyBlock, POLICY_DATA_FILE);
 
-env = rlSimulinkEnv(mdl, agentblk, obsInfo, actInfo);
-simOptions = rlSimulationOptions(MaxSteps=maxsteps);
+% Enable logging of the Policy block output so k_L can be stored in the CSV.
+tryEnablePolicyActionLogging(policyBlock);
 
 if ~exist(RESULTS_DIR, "dir")
     mkdir(RESULTS_DIR);
@@ -117,7 +126,7 @@ end
 save(fullfile(RESULTS_DIR, "random_training_domain_IC_set.mat"), "IC");
 
 %% ================================================================
-%% TEST LOOP: ALL AGENTS x ALL INITIAL CONDITIONS
+%% TEST LOOP: ALL POLICIES x ALL INITIAL CONDITIONS
 %% ================================================================
 emptyRow = makeEmptyResultRow();
 rows = repmat(emptyRow, 0, 1);
@@ -127,8 +136,12 @@ for iAgent = 1:numel(agentFiles)
     agentName = agentFiles(iAgent).name;
     agentLabel = agentFiles(iAgent).label;
 
-    fprintf("\n[%d/%d] Carico agente: %s\n", iAgent, numel(agentFiles), agentPath);
+    fprintf("\n[%d/%d] Preparo policy da agente: %s\n", iAgent, numel(agentFiles), agentPath);
     agent = loadAgentFromMat(agentPath);
+
+    % This is the key point: the Policy block always keeps the same file name.
+    % Only the contents of blockAgentData.mat are changed for the current agent.
+    regenerateFixedPolicyDataFile(agent, POLICY_DATA_FILE, policyBlock);
 
     for iTest = 1:N_TESTS
         fprintf("  Test %3d/%3d... ", iTest, N_TESTS);
@@ -148,6 +161,7 @@ for iAgent = 1:numel(agentFiles)
         row.agent_file = string(agentName);
         row.agent_label = string(agentLabel);
         row.agent_path = string(agentPath);
+        row.policy_data_file = string(POLICY_DATA_FILE);
         row.test_id = iTest;
 
         % Initial condition, both raw and state-space representation.
@@ -166,10 +180,12 @@ for iAgent = 1:numel(agentFiles)
         row.ic_sampling_attempts = IC(iTest).attempts;
 
         try
-            experience = sim(env, agent, simOptions);
+            simOut = sim(mdl, ...
+                "StopTime", num2str(Tf), ...
+                "ReturnWorkspaceOutputs", "on");
 
-            row.k_L = extractActionValue(experience);
-            [final_pos, usedVarName] = extractFinalPositionFromWorkspace(target);
+            row.k_L = extractActionValueFromSimulation(simOut);
+            [final_pos, usedVarName] = extractFinalPosition(simOut, target);
 
             row.final_position_source = string(usedVarName);
             row.final_X_m = final_pos(1);
@@ -179,7 +195,6 @@ for iAgent = 1:numel(agentFiles)
             row.landing_error_3d_m = norm(final_pos - target);
             row.landing_error_percent_of_initial_range = ...
                 100 * row.landing_error_radius_m / max(row.r0_m, eps);
-            row.reward = extractRewardValue(experience);
             row.status = "ok";
 
             fprintf("OK | err_xy = %.3f m | err%% = %.3f | k_L = %.4f\n", ...
@@ -275,10 +290,88 @@ function setupBaseWorkspace(Tf, Ts)
     assignin('base', 'rigeneration_step_s',    300);
 end
 
+function blockPath = findPolicyBlock(mdl, candidates)
+    for i = 1:numel(candidates)
+        if getSimulinkBlockHandle(candidates(i)) > 0
+            blockPath = char(candidates(i));
+            return;
+        end
+    end
+
+    allBlocks = find_system(mdl, "LookUnderMasks", "all", "FollowLinks", "on", "Type", "Block");
+    policyLike = allBlocks(contains(string(allBlocks), "Policy", "IgnoreCase", true));
+
+    if ~isempty(policyLike)
+        blockPath = char(policyLike(1));
+        return;
+    end
+
+    error("Non trovo il blocco Policy. Controlla il nome nel modello %s.", mdl);
+end
+
+function trySetPolicyBlockDataFile(policyBlock, policyDataFile)
+    dialogParams = get_param(policyBlock, "DialogParameters");
+    names = string(fieldnames(dialogParams));
+
+    candidateParamNames = [
+        "PolicyDataFile", ...
+        "PolicyDataMATFile", ...
+        "PolicyFile", ...
+        "PolicyFileName", ...
+        "MATFileName", ...
+        "AgentDataFile", ...
+        "BlockAgentDataFile"];
+
+    for i = 1:numel(candidateParamNames)
+        p = candidateParamNames(i);
+        if any(names == p)
+            try
+                set_param(policyBlock, p, char(policyDataFile));
+                fprintf("Policy block data file impostato tramite parametro %s = %s\n", p, policyDataFile);
+                return;
+            catch
+            end
+        end
+    end
+
+    fprintf("[INFO] Nome parametro MAT file del blocco Policy non identificato automaticamente.\n");
+    fprintf("       Lo script continua assumendo che il mask punti già a %s.\n", policyDataFile);
+end
+
+function tryEnablePolicyActionLogging(policyBlock)
+    try
+        ph = get_param(policyBlock, "PortHandles");
+        if ~isempty(ph.Outport)
+            line = get_param(ph.Outport(1), "Line");
+            if line > 0
+                try
+                    set_param(line, "Name", "k_L");
+                catch
+                end
+                try
+                    set_param(line, "DataLogging", "on");
+                    set_param(line, "DataLoggingNameMode", "Custom");
+                    set_param(line, "DataLoggingName", "k_L");
+                catch
+                end
+                try
+                    mdl = bdroot(policyBlock);
+                    set_param(mdl, "SignalLogging", "on");
+                    set_param(mdl, "SignalLoggingName", "logsout");
+                catch
+                end
+            end
+        end
+    catch
+        fprintf("[WARN] Non riesco ad abilitare automaticamente il logging di k_L.\n");
+    end
+end
+
 function row = makeEmptyResultRow()
     row.agent_file = "";
     row.agent_label = "";
     row.agent_path = "";
+    row.policy_data_file = "";
     row.test_id = NaN;
 
     row.initial_X0_xyz = "";
@@ -303,7 +396,6 @@ function row = makeEmptyResultRow()
     row.landing_error_radius_m = NaN;
     row.landing_error_3d_m = NaN;
     row.landing_error_percent_of_initial_range = NaN;
-    row.reward = NaN;
     row.status = "not_run";
     row.error_message = "";
 end
@@ -396,6 +488,58 @@ function agent = loadAgentFromMat(agentPath)
     end
 end
 
+function regenerateFixedPolicyDataFile(agent, policyDataFile, policyBlock)
+    if exist(policyDataFile, "file")
+        delete(policyDataFile);
+    end
+
+    fprintf("  Genero %s per il blocco Policy...\n", policyDataFile);
+
+    generated = false;
+    errMsgs = strings(0,1);
+
+    % The simple syntax is intentionally first: in current RL Toolbox releases
+    % generatePolicyBlock(agent) creates blockAgentData.mat for the Policy block.
+    try
+        generatePolicyBlock(agent);
+        generated = exist(policyDataFile, "file") == 2;
+    catch ME
+        errMsgs(end+1) = "generatePolicyBlock(agent): " + string(ME.message); %#ok<AGROW>
+    end
+
+    % Defensive fallbacks for different MATLAB releases/name-value syntaxes.
+    if ~generated
+        try
+            generatePolicyBlock(agent, "MATFileName", char(policyDataFile));
+            generated = exist(policyDataFile, "file") == 2;
+        catch ME
+            errMsgs(end+1) = "generatePolicyBlock(agent, MATFileName): " + string(ME.message); %#ok<AGROW>
+        end
+    end
+
+    if ~generated
+        try
+            generatePolicyBlock(agent, "PolicyDataFile", char(policyDataFile));
+            generated = exist(policyDataFile, "file") == 2;
+        catch ME
+            errMsgs(end+1) = "generatePolicyBlock(agent, PolicyDataFile): " + string(ME.message); %#ok<AGROW>
+        end
+    end
+
+    if ~generated
+        error("Non riesco a generare %s. Tentativi falliti:\n%s", ...
+            policyDataFile, strjoin(errMsgs, newline));
+    end
+
+    % Force the Policy block/model to see the freshly overwritten file.
+    trySetPolicyBlockDataFile(policyBlock, policyDataFile);
+    clear(policyDataFile);
+    try
+        set_param(bdroot(policyBlock), "SimulationCommand", "update");
+    catch
+    end
+end
+
 function [X0_rand, V0_rand, theta0_ph, heading_err_deg, attempts] = sampleTrainingIC( ...
         X0_center, V0_ref, target_pos, R, maxAngleDeg)
 
@@ -429,15 +573,28 @@ function [X0_rand, V0_rand, theta0_ph, heading_err_deg, attempts] = sampleTraini
 end
 
 function clearLoggedWorkspaceVariables()
-    varsToClear = ["xe", "x", "X", "pos", "position", "k_L", "kL", "action", "act"];
+    varsToClear = ["xe", "x", "X", "pos", "position", "k_L", "kL", "action", "act", "logsout"];
     for iVar = 1:numel(varsToClear)
         evalin("base", sprintf("if exist('%s','var'); clear('%s'); end", varsToClear(iVar), varsToClear(iVar)));
     end
 end
 
-function [finalPos, usedVarName] = extractFinalPositionFromWorkspace(target)
+function [finalPos, usedVarName] = extractFinalPosition(simOut, target)
     candidateNames = ["xe", "x", "X", "pos", "position"];
 
+    % First try SimulationOutput.
+    for iName = 1:numel(candidateNames)
+        varName = candidateNames(iName);
+        try
+            raw = simOut.get(char(varName));
+            finalPos = extractFinalPositionFromLoggedData(raw, target);
+            usedVarName = "simOut." + varName;
+            return;
+        catch
+        end
+    end
+
+    % Then try base workspace, because To Workspace blocks may write there.
     for iName = 1:numel(candidateNames)
         varName = candidateNames(iName);
         existsVar = evalin("base", sprintf("exist('%s','var')", varName));
@@ -445,10 +602,9 @@ function [finalPos, usedVarName] = extractFinalPositionFromWorkspace(target)
             raw = evalin("base", varName);
             try
                 finalPos = extractFinalPositionFromLoggedData(raw, target);
-                usedVarName = varName;
+                usedVarName = "base." + varName;
                 return;
             catch
-                % Try next candidate.
             end
         end
     end
@@ -522,13 +678,10 @@ function finalPos = extractFinalPositionFromLoggedData(raw, target)
 
     finalPos = finalPos(:);
 
-    % If the signal contains extra channels and this heuristic selected an invalid
-    % triplet, fail explicitly instead of silently computing a wrong error.
     if numel(finalPos) ~= 3 || any(~isfinite(finalPos))
         error("Posizione finale non valida.");
     end
 
-    % Keep target in signature to make the interpretation explicit.
     %#ok<NASGU>
 end
 
@@ -551,32 +704,39 @@ function row = lastValidRow(mat)
     row = mat(idx, :);
 end
 
-function rewardVal = extractRewardValue(experience)
-    rewardVal = NaN;
-
-    try
-        if isprop(experience, "Reward") || isfield(experience, "Reward")
-            rewardVal = extractLastNumericValue(experience.Reward);
-        end
-    catch
-        rewardVal = NaN;
-    end
-end
-
-function actionVal = extractActionValue(experience)
+function actionVal = extractActionValueFromSimulation(simOut)
     actionVal = NaN;
 
+    % 1) Signal logging from the policy output line.
     try
-        if isprop(experience, "Action") || isfield(experience, "Action")
-            actionVal = extractLastNumericValue(experience.Action);
-            return;
+        logsout = simOut.get("logsout");
+        namesToTry = ["k_L", "action", "act"];
+        for i = 1:numel(namesToTry)
+            try
+                el = logsout.get(char(namesToTry(i)));
+                if ~isempty(el)
+                    actionVal = extractLastNumericValue(el.Values);
+                    return;
+                end
+            catch
+            end
         end
     catch
-        actionVal = NaN;
     end
 
-    % Fallback: read action from common workspace variables if available.
+    % 2) SimulationOutput variables.
     candidateNames = ["k_L", "kL", "action", "act"];
+    for iName = 1:numel(candidateNames)
+        varName = candidateNames(iName);
+        try
+            raw = simOut.get(char(varName));
+            actionVal = extractLastNumericValue(raw);
+            return;
+        catch
+        end
+    end
+
+    % 3) Base workspace fallback.
     for iName = 1:numel(candidateNames)
         varName = candidateNames(iName);
         existsVar = evalin("base", sprintf("exist('%s','var')", varName));
